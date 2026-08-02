@@ -160,27 +160,56 @@ public class ExportJob {
 
         UUID uuid = UUID.randomUUID();
 
-        String tempFileName = "replay_export_temp/" + uuid + "." + this.settings.container().extension();
-        Path exportTempFile = Path.of(tempFileName);
-        Path exportTempFolder = exportTempFile.getParent();
+        // Write the temp file next to the final output so Files.move is a same-directory
+        // rename. The old replay_export_temp/ path often lived on a different drive than the
+        // user-chosen output, turning the "move" into a full multi-GB copy on the client thread
+        // after encoding already finished — which freezes the UI even though the video exists.
+        Path exportTempFile;
+        Path exportTempFolder = null;
+        if (this.settings.container() == VideoContainer.PNG_SEQUENCE) {
+            exportTempFile = Path.of("replay_export_temp/" + uuid + ".png");
+            exportTempFolder = exportTempFile.getParent();
+        } else {
+            Path output = this.settings.output();
+            Path outputDir = output.getParent();
+            if (outputDir == null) {
+                outputDir = Path.of(".");
+            }
+            exportTempFile = outputDir.resolve(".flashback-export-" + uuid + "." + this.settings.container().extension());
+        }
 
         int oldGuiScale = Minecraft.getInstance().options.guiScale().get();
 
         this.extraDummyFrames = Flashback.getConfig().exporting.exportRenderDummyFrames;
 
         try {
-            Files.createDirectories(exportTempFolder);
+            if (exportTempFolder != null) {
+                Files.createDirectories(exportTempFolder);
+            } else {
+                Path parent = exportTempFile.getParent();
+                if (parent != null) {
+                    Files.createDirectories(parent);
+                }
+            }
+            Files.deleteIfExists(exportTempFile);
 
             RenderTarget mainTarget = Minecraft.getInstance().mainRenderTarget;
             this.infoRenderTarget = new TextureTarget(mainTarget.width, mainTarget.height, false, Minecraft.ON_OSX);
 
-            try (VideoWriter encoder = createVideoWriter(this.settings, tempFileName);
+            try (VideoWriter encoder = createVideoWriter(this.settings, exportTempFile.toAbsolutePath().toString());
                  SaveableFramebufferQueue downloader = new SaveableFramebufferQueue(this.settings.resolutionX(), this.settings.resolutionY())) {
                 doExport(encoder, downloader);
             }
 
             if (this.settings.container() != VideoContainer.PNG_SEQUENCE) {
+                this.shouldChangeFramebufferSize = false;
+                long moveStart = System.currentTimeMillis();
+                this.finishFrameProgress("Moving video to output... 0s");
                 Files.move(exportTempFile, this.settings.output(), StandardCopyOption.REPLACE_EXISTING);
+                long moveSeconds = (System.currentTimeMillis() - moveStart) / 1000;
+                if (moveSeconds > 0) {
+                    Flashback.LOGGER.info("Moved export to {} in {}s", this.settings.output(), moveSeconds);
+                }
             }
 
             try {
@@ -230,15 +259,17 @@ public class ExportJob {
                 Files.deleteIfExists(exportTempFile);
             } catch (IOException ignored) {}
 
-            try {
-                boolean empty;
-                try (var stream = Files.newDirectoryStream(exportTempFolder)) {
-                    empty = !stream.iterator().hasNext();
-                }
-                if (empty) {
-                    Files.deleteIfExists(exportTempFolder);
-                }
-            } catch (IOException ignored) {}
+            if (exportTempFolder != null) {
+                try {
+                    boolean empty;
+                    try (var stream = Files.newDirectoryStream(exportTempFolder)) {
+                        empty = !stream.iterator().hasNext();
+                    }
+                    if (empty) {
+                        Files.deleteIfExists(exportTempFolder);
+                    }
+                } catch (IOException ignored) {}
+            }
         }
     }
 
@@ -427,7 +458,14 @@ public class ExportJob {
         }
 
         submitDownloadedFrames(videoWriter, downloader, true);
-        videoWriter.finish();
+
+        long finishStart = System.currentTimeMillis();
+        this.shouldChangeFramebufferSize = false;
+        videoWriter.finish(info -> {
+            long time = System.currentTimeMillis() - finishStart;
+            finishFrameProgress("Finalizing video (" + info + ")... " + time / 1000 + "s");
+        });
+        this.shouldChangeFramebufferSize = true;
     }
 
     private void updateRandoms(Random random, Random mathRandom) {
@@ -562,8 +600,18 @@ public class ExportJob {
     }
 
     private void submitDownloadedFrames(VideoWriter videoWriter, SaveableFramebufferQueue downloader, boolean drain) {
+        long drainStart = System.currentTimeMillis();
+        boolean firstDrainFrame = true;
         SaveableFramebufferQueue.DownloadedFrame frame;
         while (true) {
+            if (drain) {
+                long time = System.currentTimeMillis() - drainStart;
+                this.shouldChangeFramebufferSize = false;
+                finishFrameProgress("Capturing " + downloader.pendingCount() + " output frames... " + time / 1000 + "s", firstDrainFrame);
+                this.shouldChangeFramebufferSize = true;
+                firstDrainFrame = false;
+            }
+
             long start = System.nanoTime();
             frame = downloader.finishDownload(drain);
             downloadTimeNanos += System.nanoTime() - start;
@@ -573,13 +621,48 @@ public class ExportJob {
             }
 
             if (this.firstFrame == null) {
-                this.firstFrame = frame.image().mappedCopy(x -> 0xFF000000 | x);
+                this.firstFrame = createThumbnail(frame.image());
             }
             this.writtenFrames += 1;
 
             start = System.nanoTime();
             videoWriter.encode(frame.image(), frame.audioBuffer());
             encodeTimeNanos += System.nanoTime() - start;
+        }
+    }
+
+    private static NativeImage createThumbnail(NativeImage source) {
+        final int desiredW = 240;
+        final int desiredH = 135;
+
+        int originalW = source.getWidth();
+        int originalH = source.getHeight();
+
+        int width;
+        int height;
+        if (originalW * desiredH > desiredW * originalH) {
+            width = desiredW;
+            height = Math.max(1, desiredW * originalH / originalW);
+        } else {
+            width = Math.max(1, desiredH * originalW / originalH);
+            height = desiredH;
+        }
+
+        NativeImage opaque = source.mappedCopy(x -> 0xFF000000 | x);
+        try {
+            if (opaque.getWidth() == width && opaque.getHeight() == height) {
+                NativeImage keep = opaque;
+                opaque = null;
+                return keep;
+            }
+
+            NativeImage thumbnail = new NativeImage(width, height, false);
+            opaque.resizeSubRectTo(0, 0, opaque.getWidth(), opaque.getHeight(), thumbnail);
+            return thumbnail;
+        } finally {
+            if (opaque != null) {
+                opaque.close();
+            }
         }
     }
 
@@ -590,53 +673,6 @@ public class ExportJob {
         if (currentTime - this.lastRenderMillis > 1000/60 || currentFrame == totalFrames) {
             this.progressCount = currentFrame;
             this.progressOutOf = totalFrames;
-
-            Window window = Minecraft.getInstance().getWindow();
-
-            {
-                GlStateManager._colorMask(true, true, true, false);
-                GlStateManager._disableDepthTest();
-                GlStateManager._depthMask(false);
-                GlStateManager._viewport(0, 0, window.getWidth(), window.getHeight());
-                GlStateManager._disableBlend();
-
-                Minecraft minecraft = Minecraft.getInstance();
-                ShaderInstance shaderInstance = Objects.requireNonNull(minecraft.gameRenderer.blitShader, "Blit shader not loaded");
-                shaderInstance.setSampler("DiffuseSampler", framebuffer.colorTextureId);
-                shaderInstance.apply();
-                BufferBuilder bufferBuilder = RenderSystem.renderThreadTesselator().begin(VertexFormat.Mode.QUADS, DefaultVertexFormat.BLIT_SCREEN);
-                bufferBuilder.addVertex(0.0F, 0.0F, 0.0F);
-                bufferBuilder.addVertex(1.0F, 0.0F, 0.0F);
-                bufferBuilder.addVertex(1.0F, 1.0F, 0.0F);
-                bufferBuilder.addVertex(0.0F, 1.0F, 0.0F);
-                BufferUploader.draw(bufferBuilder.buildOrThrow());
-                shaderInstance.clear();
-                GlStateManager._depthMask(true);
-                GlStateManager._colorMask(true, true, true, true);
-            }
-
-            this.lastRenderMillis = currentTime;
-
-            Font font = Minecraft.getInstance().font;
-            var bufferSource = Minecraft.getInstance().renderBuffers().bufferSource();
-            bufferSource.endBatch();
-            infoRenderTarget.bindWrite(true);
-
-            RenderSystem.clearColor(0.0f, 0.0f, 0.0f, 0.0f);
-
-            RenderSystem.clear(16640, Minecraft.ON_OSX);
-
-            float guiScale = 4f;
-            int scaledWidth = (int) Math.ceil(infoRenderTarget.width / guiScale);
-            int scaledHeight = (int) Math.ceil(infoRenderTarget.height / guiScale);
-
-            Matrix4f matrix4f = new Matrix4f().setOrtho(0.0f, scaledWidth, scaledHeight, 0.0f, 1000.0f, 21000.0f);
-            RenderSystem.setProjectionMatrix(matrix4f, VertexSorting.ORTHOGRAPHIC_Z);
-
-            Matrix4f matrix = new Matrix4f();
-            matrix.translate(0.0f, 0.0f, -11000.0f);
-
-            RenderSystem.disableDepthTest();
 
             List<String> lines = new ArrayList<>();
 
@@ -696,55 +732,124 @@ public class ExportJob {
                 this.escapeCancelStartMillis = -1;
             }
 
-            int x = scaledWidth / 2;
-            int y = scaledHeight / 2 - font.lineHeight * (lines.size() + 1)/2;
-            for (String line : lines) {
-                if (line.isEmpty()) {
-                    y += font.lineHeight / 2 + 1;
-                } else {
-                    font.drawInBatch(line, x - font.width(line)/2f, y,
-                            -1, true, matrix, bufferSource, Font.DisplayMode.NORMAL, 0, 0xF000F0);
-                    y += font.lineHeight;
-                }
-            }
-
-            double mouseX = ReplayUI.imguiGlfw.rawMouseX / window.getWidth() * scaledWidth;
-            double mouseY = ReplayUI.imguiGlfw.rawMouseY / window.getHeight() * scaledHeight;
-
-            y += font.lineHeight / 2 + 1;
-
-            String patreon = "https://www.patreon.com/flashbackmod";
-            int patreonWidth = font.width(patreon);
-            if (mouseX > x - patreonWidth/2f && mouseX < x + patreonWidth/2f && mouseY > y && mouseY < y + font.lineHeight) {
-                font.drawInBatch(Component.literal(patreon).withStyle(ChatFormatting.UNDERLINE), x - patreonWidth/2f, y,
-                    -1, true, matrix, bufferSource, Font.DisplayMode.NORMAL, 0, 0xF000F0);
-
-                if (GLFW.glfwGetMouseButton(window.getWindow(), GLFW.GLFW_MOUSE_BUTTON_LEFT) != 0) {
-                    if (!this.patreonLinkClicked) {
-                        this.patreonLinkClicked = true;
-                        Util.getPlatform().openUri(patreon);
-                    }
-                } else {
-                    this.patreonLinkClicked = false;
-                }
-            } else {
-                font.drawInBatch(patreon, x - patreonWidth/2f, y,
-                    -1, true, matrix, bufferSource, Font.DisplayMode.NORMAL, 0, 0xF000F0);
-                this.patreonLinkClicked = false;
-            }
-
-            bufferSource.endBatch();
-            RenderSystem.enableDepthTest();
-
-            infoRenderTarget.unbindWrite();
-
-            RenderSystem.defaultBlendFunc();
-            RenderSystem.enableBlend();
-            infoRenderTarget.blitToScreen(window.getWidth(), window.getHeight(), false);
-            Minecraft.getInstance().getWindow().updateDisplay();
+            renderProgressOverlay(framebuffer, infoRenderTarget, lines, currentTime);
         }
 
         return cancel;
+    }
+
+    private void finishFrameProgress(String message) {
+        finishFrameProgress(message, false);
+    }
+
+    private void finishFrameProgress(String message, boolean forceShow) {
+        if (this.infoRenderTarget == null) {
+            return;
+        }
+
+        long currentTime = System.currentTimeMillis();
+        if (!forceShow && currentTime - this.lastRenderMillis <= 1000 / 60) {
+            return;
+        }
+
+        RenderTarget framebuffer = Minecraft.getInstance().mainRenderTarget;
+        renderProgressOverlay(framebuffer, this.infoRenderTarget, List.of(message), currentTime);
+    }
+
+    private void renderProgressOverlay(RenderTarget framebuffer, RenderTarget infoRenderTarget, List<String> lines, long currentTime) {
+        Window window = Minecraft.getInstance().getWindow();
+
+        {
+            GlStateManager._colorMask(true, true, true, false);
+            GlStateManager._disableDepthTest();
+            GlStateManager._depthMask(false);
+            GlStateManager._viewport(0, 0, window.getWidth(), window.getHeight());
+            GlStateManager._disableBlend();
+
+            Minecraft minecraft = Minecraft.getInstance();
+            ShaderInstance shaderInstance = Objects.requireNonNull(minecraft.gameRenderer.blitShader, "Blit shader not loaded");
+            shaderInstance.setSampler("DiffuseSampler", framebuffer.colorTextureId);
+            shaderInstance.apply();
+            BufferBuilder bufferBuilder = RenderSystem.renderThreadTesselator().begin(VertexFormat.Mode.QUADS, DefaultVertexFormat.BLIT_SCREEN);
+            bufferBuilder.addVertex(0.0F, 0.0F, 0.0F);
+            bufferBuilder.addVertex(1.0F, 0.0F, 0.0F);
+            bufferBuilder.addVertex(1.0F, 1.0F, 0.0F);
+            bufferBuilder.addVertex(0.0F, 1.0F, 0.0F);
+            BufferUploader.draw(bufferBuilder.buildOrThrow());
+            shaderInstance.clear();
+            GlStateManager._depthMask(true);
+            GlStateManager._colorMask(true, true, true, true);
+        }
+
+        this.lastRenderMillis = currentTime;
+
+        Font font = Minecraft.getInstance().font;
+        var bufferSource = Minecraft.getInstance().renderBuffers().bufferSource();
+        bufferSource.endBatch();
+        infoRenderTarget.bindWrite(true);
+
+        RenderSystem.clearColor(0.0f, 0.0f, 0.0f, 0.0f);
+
+        RenderSystem.clear(16640, Minecraft.ON_OSX);
+
+        float guiScale = 4f;
+        int scaledWidth = (int) Math.ceil(infoRenderTarget.width / guiScale);
+        int scaledHeight = (int) Math.ceil(infoRenderTarget.height / guiScale);
+
+        Matrix4f matrix4f = new Matrix4f().setOrtho(0.0f, scaledWidth, scaledHeight, 0.0f, 1000.0f, 21000.0f);
+        RenderSystem.setProjectionMatrix(matrix4f, VertexSorting.ORTHOGRAPHIC_Z);
+
+        Matrix4f matrix = new Matrix4f();
+        matrix.translate(0.0f, 0.0f, -11000.0f);
+
+        RenderSystem.disableDepthTest();
+
+        int x = scaledWidth / 2;
+        int y = scaledHeight / 2 - font.lineHeight * (lines.size() + 1)/2;
+        for (String line : lines) {
+            if (line.isEmpty()) {
+                y += font.lineHeight / 2 + 1;
+            } else {
+                font.drawInBatch(line, x - font.width(line)/2f, y,
+                        -1, true, matrix, bufferSource, Font.DisplayMode.NORMAL, 0, 0xF000F0);
+                y += font.lineHeight;
+            }
+        }
+
+        double mouseX = ReplayUI.imguiGlfw.rawMouseX / window.getWidth() * scaledWidth;
+        double mouseY = ReplayUI.imguiGlfw.rawMouseY / window.getHeight() * scaledHeight;
+
+        y += font.lineHeight / 2 + 1;
+
+        String patreon = "https://www.patreon.com/flashbackmod";
+        int patreonWidth = font.width(patreon);
+        if (mouseX > x - patreonWidth/2f && mouseX < x + patreonWidth/2f && mouseY > y && mouseY < y + font.lineHeight) {
+            font.drawInBatch(Component.literal(patreon).withStyle(ChatFormatting.UNDERLINE), x - patreonWidth/2f, y,
+                -1, true, matrix, bufferSource, Font.DisplayMode.NORMAL, 0, 0xF000F0);
+
+            if (GLFW.glfwGetMouseButton(window.getWindow(), GLFW.GLFW_MOUSE_BUTTON_LEFT) != 0) {
+                if (!this.patreonLinkClicked) {
+                    this.patreonLinkClicked = true;
+                    Util.getPlatform().openUri(patreon);
+                }
+            } else {
+                this.patreonLinkClicked = false;
+            }
+        } else {
+            font.drawInBatch(patreon, x - patreonWidth/2f, y,
+                -1, true, matrix, bufferSource, Font.DisplayMode.NORMAL, 0, 0xF000F0);
+            this.patreonLinkClicked = false;
+        }
+
+        bufferSource.endBatch();
+        RenderSystem.enableDepthTest();
+
+        infoRenderTarget.unbindWrite();
+
+        RenderSystem.defaultBlendFunc();
+        RenderSystem.enableBlend();
+        infoRenderTarget.blitToScreen(window.getWidth(), window.getHeight(), false);
+        Minecraft.getInstance().getWindow().updateDisplay();
     }
 
     private String formatTime(long millis) {
