@@ -52,6 +52,10 @@ public class SaveableFramebufferQueue implements AutoCloseable {
         return this.available.removeFirst();
     }
 
+    public int pendingCount() {
+        return this.waiting.size();
+    }
+
     private void blitFlip(RenderTarget src, boolean supersampling) {
         int oldFilterMode = src.filterMode;
         if (supersampling) {
