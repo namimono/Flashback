@@ -4,6 +4,7 @@ import com.mojang.blaze3d.platform.NativeImage;
 import com.moulberry.flashback.Flashback;
 import com.moulberry.flashback.SneakyThrow;
 import com.moulberry.flashback.combo_options.AudioCodec;
+import com.moulberry.flashback.combo_options.VideoContainer;
 import it.unimi.dsi.fastutil.ints.IntSet;
 import org.bytedeco.ffmpeg.avutil.AVFrame;
 import org.bytedeco.ffmpeg.avutil.AVPixFmtDescriptor;
@@ -143,6 +144,16 @@ public class AsyncFFmpegVideoWriter implements AutoCloseable, VideoWriter {
                 recorder.setAudioBitrate(256000);
             }
 
+            // Regular MP4/MOV keeps every packet index in memory and writes a giant moov atom inside
+            // recorder.stop()/av_write_trailer. That is what freezes the game on
+            // "Finalizing video (thread finish)" for long exports — the frames are already encoded.
+            // Fragmented MP4 writes indexes incrementally, so stop() returns almost immediately.
+            // Compatible with VLC/browsers/YouTube/most editors; avoids the historic end-of-export hang.
+            if (settings.container() == VideoContainer.MP4 || settings.container() == VideoContainer.MOV) {
+                recorder.setOption("movflags", "frag_keyframe+empty_moov+default_base_moof");
+                Flashback.LOGGER.info("Using fragmented MP4/MOV to speed up export finalize");
+            }
+
             recorder.start();
 
             this.encodeQueue = new ArrayBlockingQueue<>(needsRescale ? 24 : 32);
@@ -174,8 +185,13 @@ public class AsyncFFmpegVideoWriter implements AutoCloseable, VideoWriter {
                 try {
                     if (src == null) {
                         if (this.finishEncodeThread.get()) {
+                            // stop() already flush + write_trailer + release.
+                            // Do NOT also call close() — close() calls stop()+release() again.
+                            long finalizeStart = System.currentTimeMillis();
+                            Flashback.LOGGER.info("Export finalize: recorder.stop() begin");
                             recorder.stop();
-                            recorder.close();
+                            Flashback.LOGGER.info("Export finalize: recorder.stop() finished in {} ms",
+                                System.currentTimeMillis() - finalizeStart);
                             this.finishedWriting.set(true);
                             return;
                         } else {

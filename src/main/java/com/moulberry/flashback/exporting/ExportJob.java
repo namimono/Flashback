@@ -204,7 +204,7 @@ public class ExportJob {
             if (this.settings.container() != VideoContainer.PNG_SEQUENCE) {
                 this.shouldChangeFramebufferSize = false;
                 long moveStart = System.currentTimeMillis();
-                this.finishFrameProgress("Moving video to output... 0s");
+                this.finishFrameProgress("Moving video to output... 0s", true, false);
                 Files.move(exportTempFile, this.settings.output(), StandardCopyOption.REPLACE_EXISTING);
                 long moveSeconds = (System.currentTimeMillis() - moveStart) / 1000;
                 if (moveSeconds > 0) {
@@ -463,7 +463,8 @@ public class ExportJob {
         this.shouldChangeFramebufferSize = false;
         videoWriter.finish(info -> {
             long time = System.currentTimeMillis() - finishStart;
-            finishFrameProgress("Finalizing video (" + info + ")... " + time / 1000 + "s");
+            // Keep the window alive while FFmpeg writes the container trailer on the encode thread.
+            finishFrameProgress("Finalizing video (" + info + ")... " + time / 1000 + "s", false, true);
         });
         this.shouldChangeFramebufferSize = true;
     }
@@ -607,7 +608,7 @@ public class ExportJob {
             if (drain) {
                 long time = System.currentTimeMillis() - drainStart;
                 this.shouldChangeFramebufferSize = false;
-                finishFrameProgress("Capturing " + downloader.pendingCount() + " output frames... " + time / 1000 + "s", firstDrainFrame);
+                finishFrameProgress("Capturing " + downloader.pendingCount() + " output frames... " + time / 1000 + "s", firstDrainFrame, false);
                 this.shouldChangeFramebufferSize = true;
                 firstDrainFrame = false;
             }
@@ -739,16 +740,27 @@ public class ExportJob {
     }
 
     private void finishFrameProgress(String message) {
-        finishFrameProgress(message, false);
+        finishFrameProgress(message, false, false);
     }
 
     private void finishFrameProgress(String message, boolean forceShow) {
+        finishFrameProgress(message, forceShow, false);
+    }
+
+    private void finishFrameProgress(String message, boolean forceShow, boolean keepAliveOnly) {
         if (this.infoRenderTarget == null) {
             return;
         }
 
         long currentTime = System.currentTimeMillis();
-        if (!forceShow && currentTime - this.lastRenderMillis <= 1000 / 60) {
+        // Always pump window events so the OS doesn't mark the game as not responding while
+        // the encode thread is blocked inside recorder.stop()/av_write_trailer.
+        GLFW.glfwPollEvents();
+
+        // Full framebuffer redraws during finalize can stall on the GPU while FFmpeg is doing
+        // heavy IO; keepAlive mode only repaints ~2 times per second.
+        long minInterval = keepAliveOnly ? 500 : (1000 / 60);
+        if (!forceShow && currentTime - this.lastRenderMillis <= minInterval) {
             return;
         }
 
