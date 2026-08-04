@@ -181,18 +181,9 @@ public class ExportJob {
             this.infoRenderTarget = new TextureTarget(mainTarget.width, mainTarget.height, false, Minecraft.ON_OSX);
 
             String encoderFilename = outputFile.toAbsolutePath().toString();
-            VideoWriter encoder = createVideoWriter(this.settings, encoderFilename);
-            SaveableFramebufferQueue downloader = new SaveableFramebufferQueue(this.settings.resolutionX(), this.settings.resolutionY());
-            try {
+            try (VideoWriter encoder = createVideoWriter(this.settings, encoderFilename);
+                 SaveableFramebufferQueue downloader = new SaveableFramebufferQueue(this.settings.resolutionX(), this.settings.resolutionY())) {
                 doExport(encoder, downloader);
-            } finally {
-                long closeStart = System.currentTimeMillis();
-                try {
-                    downloader.close();
-                } finally {
-                    encoder.close();
-                }
-                Flashback.LOGGER.info("Export: releasing encoder resources took {} ms", System.currentTimeMillis() - closeStart);
             }
 
             exportSucceeded = true;
@@ -219,8 +210,6 @@ public class ExportJob {
 
             this.running = false;
             this.shouldChangeFramebufferSize = false;
-
-            long cleanupStart = System.currentTimeMillis();
 
             // Restore the gui-scale option only. Do NOT call resizeDisplay() here — it can stall
             // for seconds after a high-res export and was leaving users stuck on a stale progress
@@ -262,9 +251,6 @@ public class ExportJob {
                     }
                 }
             } catch (IOException ignored) {}
-
-            Flashback.LOGGER.info("Export: post-export cleanup took {} ms (download {} ms, encode submit {} ms)",
-                System.currentTimeMillis() - cleanupStart, downloadTimeNanos / 1000000, encodeTimeNanos / 1000000);
         }
     }
 
@@ -452,31 +438,16 @@ public class ExportJob {
             }
         }
 
+        submitDownloadedFrames(videoWriter, downloader, true);
+
         long finishStart = System.currentTimeMillis();
         this.shouldChangeFramebufferSize = false;
-
-        // While encoding the backlog, encode()/finish() block on the encode thread. Without a
-        // callback the client thread sits inside a bounded queue with no repaint, which is what
-        // made the game look frozen on the last progress message at the end of an export.
-        videoWriter.setWaitCallback(reason -> showRemainingFramesProgress(videoWriter, downloader, finishStart));
-
-        try {
-            submitDownloadedFrames(videoWriter, downloader, true);
-            long framesDone = System.currentTimeMillis();
-            Flashback.LOGGER.info("Export: captured remaining frames in {} ms", framesDone - finishStart);
-
-            videoWriter.finish(info -> showRemainingFramesProgress(videoWriter, downloader, finishStart));
-            Flashback.LOGGER.info("Export: finalize took {} ms", System.currentTimeMillis() - framesDone);
-        } finally {
-            videoWriter.setWaitCallback(null);
-            this.shouldChangeFramebufferSize = true;
-        }
-    }
-
-    private void showRemainingFramesProgress(VideoWriter videoWriter, SaveableFramebufferQueue downloader, long startMillis) {
-        int remaining = downloader.pendingCount() + videoWriter.pendingFrameCount();
-        long seconds = (System.currentTimeMillis() - startMillis) / 1000;
-        finishFrameProgress("Saving video... " + remaining + " frames left, " + seconds + "s", false, true);
+        videoWriter.finish(info -> {
+            long time = System.currentTimeMillis() - finishStart;
+            // Keep the window alive while FFmpeg writes the container trailer on the encode thread.
+            finishFrameProgress("Finalizing video (" + info + ")... " + time / 1000 + "s", false, true);
+        });
+        this.shouldChangeFramebufferSize = true;
     }
 
     private void updateRandoms(Random random, Random mathRandom) {
@@ -612,10 +583,15 @@ public class ExportJob {
 
     private void submitDownloadedFrames(VideoWriter videoWriter, SaveableFramebufferQueue downloader, boolean drain) {
         long drainStart = System.currentTimeMillis();
+        boolean firstDrainFrame = true;
         SaveableFramebufferQueue.DownloadedFrame frame;
         while (true) {
             if (drain) {
-                showRemainingFramesProgress(videoWriter, downloader, drainStart);
+                long time = System.currentTimeMillis() - drainStart;
+                this.shouldChangeFramebufferSize = false;
+                finishFrameProgress("Capturing " + downloader.pendingCount() + " output frames... " + time / 1000 + "s", firstDrainFrame, false);
+                this.shouldChangeFramebufferSize = true;
+                firstDrainFrame = false;
             }
 
             long start = System.nanoTime();
@@ -744,6 +720,14 @@ public class ExportJob {
         return cancel;
     }
 
+    private void finishFrameProgress(String message) {
+        finishFrameProgress(message, false, false);
+    }
+
+    private void finishFrameProgress(String message, boolean forceShow) {
+        finishFrameProgress(message, forceShow, false);
+    }
+
     private void finishFrameProgress(String message, boolean forceShow, boolean keepAliveOnly) {
         if (this.infoRenderTarget == null) {
             return;
@@ -755,8 +739,8 @@ public class ExportJob {
         GLFW.glfwPollEvents();
 
         // Full framebuffer redraws during finalize can stall on the GPU while FFmpeg is doing
-        // heavy IO; keepAlive mode only repaints a few times per second.
-        long minInterval = keepAliveOnly ? 250 : (1000 / 60);
+        // heavy IO; keepAlive mode only repaints ~2 times per second.
+        long minInterval = keepAliveOnly ? 500 : (1000 / 60);
         if (!forceShow && currentTime - this.lastRenderMillis <= minInterval) {
             return;
         }
