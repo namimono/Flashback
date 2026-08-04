@@ -31,6 +31,8 @@ public class PNGSequenceVideoWriter implements VideoWriter {
 
     private final AtomicReference<Throwable> threadedError = new AtomicReference<>(null);
 
+    private volatile @Nullable Consumer<String> waitCallback = null;
+
     private final ArrayBlockingQueue<NativeImage> encodeQueue;
 
     public PNGSequenceVideoWriter(ExportSettings settings) {
@@ -155,11 +157,30 @@ public class PNGSequenceVideoWriter implements VideoWriter {
 
         while (true) {
             try {
-                this.encodeQueue.put(src);
-                break;
+                // Bounded offer instead of put() so the caller can keep the window responsive
+                // while the encoder works through its backlog.
+                if (this.encodeQueue.offer(src, 20, TimeUnit.MILLISECONDS)) {
+                    return;
+                }
             } catch (InterruptedException ignored) {}
+
             checkEncodeError(src);
+
+            Consumer<String> callback = this.waitCallback;
+            if (callback != null) {
+                callback.accept("encode backlog");
+            }
         }
+    }
+
+    @Override
+    public void setWaitCallback(@Nullable Consumer<String> callback) {
+        this.waitCallback = callback;
+    }
+
+    @Override
+    public int pendingFrameCount() {
+        return this.encodeQueue.size();
     }
 
     public void finish(Consumer<String> wait) {
