@@ -514,6 +514,15 @@ public class ReplayUI {
         return activeLastFrame;
     }
 
+    /**
+     * Mark the replay UI as inactive without resizing. Called when an export starts so that
+     * when the export finishes, {@link #transitionActiveState(true)} will run (and resize)
+     * after the export-done window has already been drawn for the first frame.
+     */
+    public static void prepareForExport() {
+        activeLastFrame = false;
+    }
+
     public static boolean shouldModifyViewport() {
         EditorState editorState = EditorStateManager.getCurrent();
         return isActive() && editorState != null && editorState.replayVisuals.sizing != Sizing.UNDERLAY;

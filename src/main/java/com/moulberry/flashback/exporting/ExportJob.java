@@ -49,12 +49,10 @@ import java.nio.ByteOrder;
 import java.nio.FloatBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.Random;
-import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.LockSupport;
 
@@ -152,73 +150,50 @@ public class ExportJob {
             throw new IllegalStateException("run() called twice");
         }
         this.running = true;
+        ReplayUI.prepareForExport();
         Minecraft.getInstance().mouseHandler.releaseMouse();
         Minecraft.getInstance().getSoundManager().stop();
         Minecraft.getInstance().getSoundManager().tick(true);
 
         TaskbarManager.launchTaskbarManager();
 
-        UUID uuid = UUID.randomUUID();
-
-        // Write the temp file next to the final output so Files.move is a same-directory
-        // rename. The old replay_export_temp/ path often lived on a different drive than the
-        // user-chosen output, turning the "move" into a full multi-GB copy on the client thread
-        // after encoding already finished — which freezes the UI even though the video exists.
-        Path exportTempFile;
-        Path exportTempFolder = null;
-        if (this.settings.container() == VideoContainer.PNG_SEQUENCE) {
-            exportTempFile = Path.of("replay_export_temp/" + uuid + ".png");
-            exportTempFolder = exportTempFile.getParent();
-        } else {
-            Path output = this.settings.output();
-            Path outputDir = output.getParent();
-            if (outputDir == null) {
-                outputDir = Path.of(".");
-            }
-            exportTempFile = outputDir.resolve(".flashback-export-" + uuid + "." + this.settings.container().extension());
-        }
+        // Encode straight to the final output path. A separate temp file + Files.move was still
+        // freezing the UI on "Moving video to output..." (OS/AV file locks, or a fallback copy),
+        // and the same overlay also stayed on screen during the slow resizeDisplay() afterward.
+        Path outputFile = this.settings.output();
+        boolean exportSucceeded = false;
 
         int oldGuiScale = Minecraft.getInstance().options.guiScale().get();
 
         this.extraDummyFrames = Flashback.getConfig().exporting.exportRenderDummyFrames;
 
         try {
-            if (exportTempFolder != null) {
-                Files.createDirectories(exportTempFolder);
-            } else {
-                Path parent = exportTempFile.getParent();
-                if (parent != null) {
-                    Files.createDirectories(parent);
-                }
+            Path outputParent = outputFile.getParent();
+            if (outputParent != null) {
+                Files.createDirectories(outputParent);
             }
-            Files.deleteIfExists(exportTempFile);
+
+            if (this.settings.container() != VideoContainer.PNG_SEQUENCE) {
+                Files.deleteIfExists(outputFile);
+            }
 
             RenderTarget mainTarget = Minecraft.getInstance().mainRenderTarget;
             this.infoRenderTarget = new TextureTarget(mainTarget.width, mainTarget.height, false, Minecraft.ON_OSX);
 
-            try (VideoWriter encoder = createVideoWriter(this.settings, exportTempFile.toAbsolutePath().toString());
+            String encoderFilename = outputFile.toAbsolutePath().toString();
+            try (VideoWriter encoder = createVideoWriter(this.settings, encoderFilename);
                  SaveableFramebufferQueue downloader = new SaveableFramebufferQueue(this.settings.resolutionX(), this.settings.resolutionY())) {
                 doExport(encoder, downloader);
             }
 
-            if (this.settings.container() != VideoContainer.PNG_SEQUENCE) {
-                this.shouldChangeFramebufferSize = false;
-                long moveStart = System.currentTimeMillis();
-                this.finishFrameProgress("Moving video to output... 0s", true, false);
-                Files.move(exportTempFile, this.settings.output(), StandardCopyOption.REPLACE_EXISTING);
-                long moveSeconds = (System.currentTimeMillis() - moveStart) / 1000;
-                if (moveSeconds > 0) {
-                    Flashback.LOGGER.info("Moved export to {} in {}s", this.settings.output(), moveSeconds);
-                }
-            }
+            exportSucceeded = true;
 
             try {
                 long size = 0;
                 double duration = this.writtenFrames / this.settings.framerate();
 
-                Path output = this.settings.output();
-                if (this.settings.container() != VideoContainer.PNG_SEQUENCE && Files.exists(output) && Files.isRegularFile(output)) {
-                    size = Files.size(output);
+                if (this.settings.container() != VideoContainer.PNG_SEQUENCE && Files.exists(outputFile) && Files.isRegularFile(outputFile)) {
+                    size = Files.size(outputFile);
                 }
 
                 ExportDoneWindow.addFinishedExportEntry(new ExportDoneWindow.FinishedExportEntry(this.settings, this.firstFrame, duration, size));
@@ -227,12 +202,20 @@ public class ExportJob {
         } catch (IOException e) {
             throw new RuntimeException(e);
         } finally {
+            if (!exportSucceeded && this.settings.container() != VideoContainer.PNG_SEQUENCE) {
+                try {
+                    Files.deleteIfExists(outputFile);
+                } catch (IOException ignored) {}
+            }
+
             this.running = false;
             this.shouldChangeFramebufferSize = false;
 
-            // Reset display size
+            // Restore the gui-scale option only. Do NOT call resizeDisplay() here — it can stall
+            // for seconds after a high-res export and was leaving users stuck on a stale progress
+            // overlay ("Moving video to output..."). ReplayUI.transitionActiveState() resizes
+            // after ExportDoneWindow has already been drawn for the first frame.
             Minecraft.getInstance().options.guiScale().set(oldGuiScale);
-            Minecraft.getInstance().resizeDisplay();
 
             // Refreeze server & client
             replayServer.replayPaused = true;
@@ -255,21 +238,19 @@ public class ExportJob {
                 this.firstFrame = null;
             }
 
+            // Best-effort cleanup of temp files left by older builds
             try {
-                Files.deleteIfExists(exportTempFile);
+                Path outputParent = outputFile.getParent();
+                if (outputParent != null && Files.isDirectory(outputParent)) {
+                    try (var stream = Files.newDirectoryStream(outputParent, ".flashback-export-*")) {
+                        for (Path leftover : stream) {
+                            try {
+                                Files.deleteIfExists(leftover);
+                            } catch (IOException ignored) {}
+                        }
+                    }
+                }
             } catch (IOException ignored) {}
-
-            if (exportTempFolder != null) {
-                try {
-                    boolean empty;
-                    try (var stream = Files.newDirectoryStream(exportTempFolder)) {
-                        empty = !stream.iterator().hasNext();
-                    }
-                    if (empty) {
-                        Files.deleteIfExists(exportTempFolder);
-                    }
-                } catch (IOException ignored) {}
-            }
         }
     }
 
