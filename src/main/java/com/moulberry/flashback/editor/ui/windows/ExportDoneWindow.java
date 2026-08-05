@@ -4,6 +4,7 @@ import com.mojang.blaze3d.platform.NativeImage;
 import com.moulberry.flashback.MedalTvUploading;
 import com.moulberry.flashback.Utils;
 import com.moulberry.flashback.editor.ui.ImGuiHelper;
+import com.moulberry.flashback.exporting.ExportFinalizer;
 import com.moulberry.flashback.exporting.ExportSettings;
 import imgui.moulberry90.ImGui;
 import imgui.moulberry90.ImGuiViewport;
@@ -70,11 +71,36 @@ public class ExportDoneWindow {
     }
 
     public static void render() {
+        renderFinalizingExport();
+
         if (!entries.isEmpty()) {
             renderFinishedExports();
         } else {
             renderInProgressUpload();
         }
+    }
+
+    /**
+     * The export finishes rendering before the encoder has written everything out, so tell the
+     * user that the file isn't ready yet instead of leaving them to guess.
+     */
+    private static void renderFinalizingExport() {
+        String status = ExportFinalizer.getStatus();
+        if (status == null) {
+            return;
+        }
+
+        ImGuiViewport viewport = ImGui.getMainViewport();
+        ImGui.setNextWindowPos(viewport.getCenterX(), viewport.getPosY() + 30, ImGuiCond.Always, 0.5f, 0.0f);
+
+        int flags = ImGuiWindowFlags.AlwaysAutoResize | ImGuiWindowFlags.NoDocking | ImGuiWindowFlags.NoSavedSettings |
+            ImGuiWindowFlags.NoTitleBar | ImGuiWindowFlags.NoResize | ImGuiWindowFlags.NoCollapse |
+            ImGuiWindowFlags.NoMove | ImGuiWindowFlags.NoFocusOnAppearing | ImGuiWindowFlags.NoNav;
+
+        if (ImGui.begin("###ExportFinalizing", flags)) {
+            ImGui.textUnformatted(status);
+        }
+        ImGui.end();
     }
 
     public static void renderFinishedExports() {

@@ -33,6 +33,8 @@ public class PNGSequenceVideoWriter implements VideoWriter {
 
     private final ArrayBlockingQueue<NativeImage> encodeQueue;
 
+    private volatile @Nullable Consumer<String> waitCallback = null;
+
     public PNGSequenceVideoWriter(ExportSettings settings) {
         this.settings = settings;
         this.encodeQueue = new ArrayBlockingQueue<>(32);
@@ -155,11 +157,28 @@ public class PNGSequenceVideoWriter implements VideoWriter {
 
         while (true) {
             try {
-                this.encodeQueue.put(src);
-                break;
+                if (this.encodeQueue.offer(src, 20, TimeUnit.MILLISECONDS)) {
+                    return;
+                }
             } catch (InterruptedException ignored) {}
+
             checkEncodeError(src);
+
+            Consumer<String> callback = this.waitCallback;
+            if (callback != null) {
+                callback.accept("encode backlog");
+            }
         }
+    }
+
+    @Override
+    public void setWaitCallback(@Nullable Consumer<String> callback) {
+        this.waitCallback = callback;
+    }
+
+    @Override
+    public int pendingFrameCount() {
+        return this.encodeQueue.size();
     }
 
     public void finish(Consumer<String> wait) {
@@ -167,14 +186,14 @@ public class PNGSequenceVideoWriter implements VideoWriter {
 
         while (!this.encodeQueue.isEmpty()) {
             checkEncodeError(null);
-            LockSupport.parkNanos("waiting for encode queue to empty", 100000L);
+            LockSupport.parkNanos("waiting for encode queue to empty", 1000000L);
             wait.accept("encode queue");
         }
 
         this.finishEncodeThread.set(true);
 
         while (!this.finishedWriting.get()) {
-            LockSupport.parkNanos("waiting for encoder thread to finish", 100000L);
+            LockSupport.parkNanos("waiting for encoder thread to finish", 1000000L);
             wait.accept("thread finish");
         }
 

@@ -523,6 +523,16 @@ public class ReplayUI {
         activeLastFrame = false;
     }
 
+    private static long exportFinishedMillis = -1;
+
+    /**
+     * The export overlay stays on screen until the editor manages to draw a frame, so the time
+     * between the two is what an "it's still frozen after the export" report is about.
+     */
+    public static void markExportFinished() {
+        exportFinishedMillis = System.currentTimeMillis();
+    }
+
     public static boolean shouldModifyViewport() {
         EditorState editorState = EditorStateManager.getCurrent();
         return isActive() && editorState != null && editorState.replayVisuals.sizing != Sizing.UNDERLAY;
@@ -983,6 +993,11 @@ public class ReplayUI {
         }
 
         transitionActiveState(true);
+
+        if (exportFinishedMillis > 0) {
+            Flashback.LOGGER.info("Export: editor drawn again {} ms after the export finished", System.currentTimeMillis() - exportFinishedMillis);
+            exportFinishedMillis = -1;
+        }
     }
 
     public static boolean isMainFrameActive() {

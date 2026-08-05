@@ -12,7 +12,6 @@ import com.moulberry.flashback.FreezeSlowdownFormula;
 import com.moulberry.flashback.Utils;
 import com.moulberry.flashback.combo_options.VideoContainer;
 import com.moulberry.flashback.editor.ui.ReplayUI;
-import com.moulberry.flashback.editor.ui.windows.ExportDoneWindow;
 import com.moulberry.flashback.exporting.taskbar.TaskbarManager;
 import com.moulberry.flashback.keyframe.KeyframeType;
 import com.moulberry.flashback.keyframe.handler.KeyframeHandler;
@@ -39,6 +38,7 @@ import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.phys.Vec3;
 import org.bytedeco.ffmpeg.global.avutil;
+import org.jetbrains.annotations.Nullable;
 import org.joml.Matrix4f;
 import org.lwjgl.glfw.GLFW;
 import org.lwjgl.openal.SOFTLoopback;
@@ -161,7 +161,7 @@ public class ExportJob {
         // freezing the UI on "Moving video to output..." (OS/AV file locks, or a fallback copy),
         // and the same overlay also stayed on screen during the slow resizeDisplay() afterward.
         Path outputFile = this.settings.output();
-        boolean exportSucceeded = false;
+        boolean handedOffToFinalizer = false;
 
         int oldGuiScale = Minecraft.getInstance().options.guiScale().get();
 
@@ -173,36 +173,38 @@ public class ExportJob {
                 Files.createDirectories(outputParent);
             }
 
+            RenderTarget mainTarget = Minecraft.getInstance().mainRenderTarget;
+            this.infoRenderTarget = new TextureTarget(mainTarget.width, mainTarget.height, false, Minecraft.ON_OSX);
+
+            // Two encoders running at once would double the memory held by buffered frames, so a
+            // queued export waits here instead - with the overlay still being redrawn.
+            ExportFinalizer.await(status -> finishFrameProgress(status, false, true), 0L);
+
             if (this.settings.container() != VideoContainer.PNG_SEQUENCE) {
                 Files.deleteIfExists(outputFile);
             }
 
-            RenderTarget mainTarget = Minecraft.getInstance().mainRenderTarget;
-            this.infoRenderTarget = new TextureTarget(mainTarget.width, mainTarget.height, false, Minecraft.ON_OSX);
-
             String encoderFilename = outputFile.toAbsolutePath().toString();
-            try (VideoWriter encoder = createVideoWriter(this.settings, encoderFilename);
-                 SaveableFramebufferQueue downloader = new SaveableFramebufferQueue(this.settings.resolutionX(), this.settings.resolutionY())) {
+            VideoWriter encoder = createVideoWriter(this.settings, encoderFilename);
+            try (SaveableFramebufferQueue downloader = new SaveableFramebufferQueue(this.settings.resolutionX(), this.settings.resolutionY())) {
                 doExport(encoder, downloader);
-            }
 
-            exportSucceeded = true;
-
-            try {
-                long size = 0;
+                // Everything that's left is pure FFmpeg work on frames we already captured, so it
+                // runs in the background instead of holding the client thread (and therefore the
+                // whole game) hostage until the encoder has caught up.
                 double duration = this.writtenFrames / this.settings.framerate();
-
-                if (this.settings.container() != VideoContainer.PNG_SEQUENCE && Files.exists(outputFile) && Files.isRegularFile(outputFile)) {
-                    size = Files.size(outputFile);
-                }
-
-                ExportDoneWindow.addFinishedExportEntry(new ExportDoneWindow.FinishedExportEntry(this.settings, this.firstFrame, duration, size));
+                ExportFinalizer.submit(encoder, this.settings, this.firstFrame, duration);
+                handedOffToFinalizer = true;
                 this.firstFrame = null;
-            } catch (IOException ignored) {}
+            } finally {
+                if (!handedOffToFinalizer) {
+                    encoder.close();
+                }
+            }
         } catch (IOException e) {
             throw new RuntimeException(e);
         } finally {
-            if (!exportSucceeded && this.settings.container() != VideoContainer.PNG_SEQUENCE) {
+            if (!handedOffToFinalizer && this.settings.container() != VideoContainer.PNG_SEQUENCE) {
                 try {
                     Files.deleteIfExists(outputFile);
                 } catch (IOException ignored) {}
@@ -211,11 +213,13 @@ public class ExportJob {
             this.running = false;
             this.shouldChangeFramebufferSize = false;
 
+            long teardownStart = System.currentTimeMillis();
+
             // Restore the gui-scale option only. Do NOT call resizeDisplay() here — it can stall
             // for seconds after a high-res export and was leaving users stuck on a stale progress
             // overlay ("Moving video to output..."). ReplayUI.transitionActiveState() resizes
             // after ExportDoneWindow has already been drawn for the first frame.
-            Minecraft.getInstance().options.guiScale().set(oldGuiScale);
+            timeTeardownStep("restore gui scale", () -> Minecraft.getInstance().options.guiScale().set(oldGuiScale));
 
             // Refreeze server & client
             replayServer.replayPaused = true;
@@ -224,13 +228,16 @@ public class ExportJob {
                 level.tickRateManager().setFrozen(true);
             }
 
-            Minecraft.getInstance().getSoundManager().stop();
-            Minecraft.getInstance().getSoundManager().play(SimpleSoundInstance.forUI(SoundEvents.NOTE_BLOCK_CHIME, 1.0f));
-            Minecraft.getInstance().getSoundManager().play(SimpleSoundInstance.forUI(SoundEvents.NOTE_BLOCK_BELL, 1.0f));
+            timeTeardownStep("finished sound", () -> {
+                Minecraft.getInstance().getSoundManager().stop();
+                Minecraft.getInstance().getSoundManager().play(SimpleSoundInstance.forUI(SoundEvents.NOTE_BLOCK_CHIME, 1.0f));
+                Minecraft.getInstance().getSoundManager().play(SimpleSoundInstance.forUI(SoundEvents.NOTE_BLOCK_BELL, 1.0f));
+            });
 
             if (this.infoRenderTarget != null) {
-                this.infoRenderTarget.destroyBuffers();
+                TextureTarget target = this.infoRenderTarget;
                 this.infoRenderTarget = null;
+                timeTeardownStep("destroy overlay framebuffer", target::destroyBuffers);
             }
 
             if (this.firstFrame != null) {
@@ -238,20 +245,42 @@ public class ExportJob {
                 this.firstFrame = null;
             }
 
-            // Best-effort cleanup of temp files left by older builds
-            try {
-                Path outputParent = outputFile.getParent();
-                if (outputParent != null && Files.isDirectory(outputParent)) {
-                    try (var stream = Files.newDirectoryStream(outputParent, ".flashback-export-*")) {
-                        for (Path leftover : stream) {
-                            try {
-                                Files.deleteIfExists(leftover);
-                            } catch (IOException ignored) {}
-                        }
-                    }
+            cleanupLeftoverTempFiles(outputFile.getParent());
+
+            Flashback.LOGGER.info("Export teardown took {} ms, {} frames written (server tick {} ms, client tick {} ms, " +
+                    "render {} ms, download {} ms, encode submit {} ms)",
+                System.currentTimeMillis() - teardownStart, this.writtenFrames, this.serverTickTimeNanos / 1000000,
+                this.clientTickTimeNanos / 1000000, this.renderTimeNanos / 1000000, this.downloadTimeNanos / 1000000,
+                this.encodeTimeNanos / 1000000);
+
+            ReplayUI.markExportFinished();
+        }
+    }
+
+    private static void timeTeardownStep(String name, Runnable step) {
+        long start = System.currentTimeMillis();
+        step.run();
+        long elapsed = System.currentTimeMillis() - start;
+        if (elapsed > 100) {
+            Flashback.LOGGER.info("Export teardown: {} took {} ms", name, elapsed);
+        }
+    }
+
+    /** Removes temp files left behind by older versions, which encoded to a temp file first. */
+    private static void cleanupLeftoverTempFiles(@Nullable Path directory) {
+        if (directory == null) {
+            return;
+        }
+
+        Util.ioPool().execute(() -> {
+            try (var stream = Files.newDirectoryStream(directory, ".flashback-export-*")) {
+                for (Path leftover : stream) {
+                    try {
+                        Files.deleteIfExists(leftover);
+                    } catch (IOException ignored) {}
                 }
             } catch (IOException ignored) {}
-        }
+        });
     }
 
     private static VideoWriter createVideoWriter(ExportSettings settings, String tempFileName) {
@@ -438,16 +467,27 @@ public class ExportJob {
             }
         }
 
-        submitDownloadedFrames(videoWriter, downloader, true);
-
-        long finishStart = System.currentTimeMillis();
+        long drainStart = System.currentTimeMillis();
         this.shouldChangeFramebufferSize = false;
-        videoWriter.finish(info -> {
-            long time = System.currentTimeMillis() - finishStart;
-            // Keep the window alive while FFmpeg writes the container trailer on the encode thread.
-            finishFrameProgress("Finalizing video (" + info + ")... " + time / 1000 + "s", false, true);
-        });
-        this.shouldChangeFramebufferSize = true;
+
+        // The encoder is usually a long way behind by now, so submitting the last few frames can
+        // block for a while inside the bounded queue. Redraw from there instead of going dark.
+        videoWriter.setWaitCallback(reason -> showSavingProgress(videoWriter, downloader, drainStart));
+        try {
+            submitDownloadedFrames(videoWriter, downloader, true);
+        } finally {
+            videoWriter.setWaitCallback(null);
+            this.shouldChangeFramebufferSize = true;
+        }
+
+        Flashback.LOGGER.info("Export: captured the remaining frames in {} ms, {} frames left to encode",
+            System.currentTimeMillis() - drainStart, videoWriter.pendingFrameCount());
+    }
+
+    private void showSavingProgress(VideoWriter videoWriter, SaveableFramebufferQueue downloader, long startMillis) {
+        int remaining = downloader.pendingCount() + videoWriter.pendingFrameCount();
+        long seconds = (System.currentTimeMillis() - startMillis) / 1000;
+        finishFrameProgress("Saving video... " + remaining + " frames left, " + seconds + "s", false, true);
     }
 
     private void updateRandoms(Random random, Random mathRandom) {
@@ -583,15 +623,10 @@ public class ExportJob {
 
     private void submitDownloadedFrames(VideoWriter videoWriter, SaveableFramebufferQueue downloader, boolean drain) {
         long drainStart = System.currentTimeMillis();
-        boolean firstDrainFrame = true;
         SaveableFramebufferQueue.DownloadedFrame frame;
         while (true) {
             if (drain) {
-                long time = System.currentTimeMillis() - drainStart;
-                this.shouldChangeFramebufferSize = false;
-                finishFrameProgress("Capturing " + downloader.pendingCount() + " output frames... " + time / 1000 + "s", firstDrainFrame, false);
-                this.shouldChangeFramebufferSize = true;
-                firstDrainFrame = false;
+                showSavingProgress(videoWriter, downloader, drainStart);
             }
 
             long start = System.nanoTime();
@@ -720,14 +755,6 @@ public class ExportJob {
         return cancel;
     }
 
-    private void finishFrameProgress(String message) {
-        finishFrameProgress(message, false, false);
-    }
-
-    private void finishFrameProgress(String message, boolean forceShow) {
-        finishFrameProgress(message, forceShow, false);
-    }
-
     private void finishFrameProgress(String message, boolean forceShow, boolean keepAliveOnly) {
         if (this.infoRenderTarget == null) {
             return;
@@ -739,8 +766,8 @@ public class ExportJob {
         GLFW.glfwPollEvents();
 
         // Full framebuffer redraws during finalize can stall on the GPU while FFmpeg is doing
-        // heavy IO; keepAlive mode only repaints ~2 times per second.
-        long minInterval = keepAliveOnly ? 500 : (1000 / 60);
+        // heavy IO; keepAlive mode only repaints a few times per second.
+        long minInterval = keepAliveOnly ? 250 : (1000 / 60);
         if (!forceShow && currentTime - this.lastRenderMillis <= minInterval) {
             return;
         }

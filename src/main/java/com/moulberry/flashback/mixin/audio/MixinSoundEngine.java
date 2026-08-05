@@ -2,6 +2,7 @@ package com.moulberry.flashback.mixin.audio;
 
 import com.moulberry.flashback.Flashback;
 import com.moulberry.flashback.editor.ui.windows.ExportDoneWindow;
+import com.moulberry.flashback.exporting.ExportFinalizer;
 import com.moulberry.flashback.exporting.ExportJobQueue;
 import com.moulberry.flashback.playback.ReplayServer;
 import com.moulberry.flashback.sound.FlashbackAudioManager;
@@ -29,11 +30,13 @@ public class MixinSoundEngine {
     public void shouldChangeDevice(CallbackInfoReturnable<Boolean> cir) {
         boolean isExportingAudio = Flashback.isExporting() && Flashback.EXPORT_JOB.getSettings().recordAudio();
 
-        // Keep the loopback device while more queued jobs are about to start.
-        // Otherwise every job boundary does a full OpenAL destroy/reload (very slow),
-        // and the final restore also blocks the client tick before ExportDoneWindow can render.
+        // Keep the loopback device while more queued jobs are about to start, or while the last
+        // export is still being written out. Otherwise every job boundary does a full OpenAL
+        // destroy/reload (very slow), and the final restore also blocks the client tick before
+        // ExportDoneWindow can render.
         if (!isExportingAudio && wasExportingAudio) {
-            if (ExportJobQueue.drainingQueue || !ExportJobQueue.queuedJobs.isEmpty() || ExportDoneWindow.isDone()) {
+            if (ExportJobQueue.drainingQueue || !ExportJobQueue.queuedJobs.isEmpty() ||
+                    ExportFinalizer.isFinalizing() || ExportDoneWindow.isDone()) {
                 cir.setReturnValue(false);
                 return;
             }
