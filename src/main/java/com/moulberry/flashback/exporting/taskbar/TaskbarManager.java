@@ -2,6 +2,7 @@ package com.moulberry.flashback.exporting.taskbar;
 
 import com.moulberry.flashback.Flashback;
 import com.moulberry.flashback.editor.ui.windows.ExportDoneWindow;
+import com.moulberry.flashback.exporting.ExportFinalizer;
 import com.moulberry.flashback.exporting.ExportJob;
 import net.minecraft.Util;
 
@@ -58,7 +59,7 @@ public class TaskbarManager {
             lastExportJobUpdate = -1;
         }
 
-        if (ExportDoneWindow.isDone()) {
+        if (ExportFinalizer.isFinalizing() || ExportDoneWindow.isDone()) {
             setTaskbarProgress(1, 1, false);
             return;
         }

@@ -50,6 +50,8 @@ public class AsyncFFmpegVideoWriter implements AutoCloseable, VideoWriter {
 
     private final AtomicReference<Throwable> threadedError = new AtomicReference<>(null);
 
+    private volatile @Nullable Consumer<String> waitCallback = null;
+
     private static final class ImageFrame implements AutoCloseable {
         private long pointer;
         private final int size;
@@ -379,19 +381,39 @@ public class AsyncFFmpegVideoWriter implements AutoCloseable, VideoWriter {
             throw new IllegalStateException("Cannot encode after finish()");
         }
 
+        ImageFrame imageFrame = new ImageFrame(src.pixels, (int) src.size, src.getWidth(), src.getHeight(),
+            4, Frame.DEPTH_INT, src.getWidth(), ExportJob.SRC_PIXEL_FORMAT, audioBuffer);
+
+        ArrayBlockingQueue<ImageFrame> queue = this.rescaleQueue != null ? this.rescaleQueue : this.encodeQueue;
+
         while (true) {
-            ImageFrame imageFrame = new ImageFrame(src.pixels, (int) src.size, src.getWidth(), src.getHeight(),
-                4, Frame.DEPTH_INT, src.getWidth(), ExportJob.SRC_PIXEL_FORMAT, audioBuffer);
             try {
-                if (this.rescaleQueue != null) {
-                    this.rescaleQueue.put(imageFrame);
-                } else {
-                    this.encodeQueue.put(imageFrame);
+                if (queue.offer(imageFrame, 20, TimeUnit.MILLISECONDS)) {
+                    return;
                 }
-                break;
             } catch (InterruptedException ignored) {}
+
             checkEncodeError(imageFrame);
+
+            Consumer<String> callback = this.waitCallback;
+            if (callback != null) {
+                callback.accept("encode backlog");
+            }
         }
+    }
+
+    @Override
+    public void setWaitCallback(@Nullable Consumer<String> callback) {
+        this.waitCallback = callback;
+    }
+
+    @Override
+    public int pendingFrameCount() {
+        int pending = this.encodeQueue.size();
+        if (this.rescaleQueue != null) {
+            pending += this.rescaleQueue.size();
+        }
+        return pending;
     }
 
     public void finish(Consumer<String> wait) {
@@ -400,14 +422,14 @@ public class AsyncFFmpegVideoWriter implements AutoCloseable, VideoWriter {
         if (this.rescaleQueue != null) {
             while (!this.rescaleQueue.isEmpty()) {
                 checkEncodeError(null);
-                LockSupport.parkNanos("waiting for rescale queue to empty", 100000L);
+                LockSupport.parkNanos("waiting for rescale queue to empty", 1000000L);
                 wait.accept("rescale");
             }
         }
 
         while (!this.encodeQueue.isEmpty()) {
             checkEncodeError(null);
-            LockSupport.parkNanos("waiting for encode queue to empty", 100000L);
+            LockSupport.parkNanos("waiting for encode queue to empty", 1000000L);
             wait.accept("encode queue");
         }
 
@@ -417,7 +439,7 @@ public class AsyncFFmpegVideoWriter implements AutoCloseable, VideoWriter {
         }
 
         while (!this.finishedWriting.get()) {
-            LockSupport.parkNanos("waiting for encoder thread to finish", 100000L);
+            LockSupport.parkNanos("waiting for encoder thread to finish", 1000000L);
             wait.accept("thread finish");
         }
 
