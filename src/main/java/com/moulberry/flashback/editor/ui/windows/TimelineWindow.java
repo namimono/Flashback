@@ -68,6 +68,8 @@ public class TimelineWindow {
     private static boolean grabbedZoomBarResizeRight = false;
     private static boolean grabbedExportBarResizeLeft = false;
     private static boolean grabbedExportBarResizeRight = false;
+    private static int exportRangeDragStartTick = -1;
+    private static boolean exportRangeDragged = false;
     private static boolean grabbedPlayback = false;
     private static boolean grabbedKeyframe = false;
     private static float grabbedKeyframeMouseX = 0;
@@ -536,7 +538,41 @@ public class TimelineWindow {
 
             boolean leftClicked = ImGui.isMouseClicked(ImGuiMouseButton.Left);
             boolean rightClicked = ImGui.isMouseClicked(ImGuiMouseButton.Right);
-            if (leftClicked && hoveredMarker != null) {
+            boolean middleClicked = ImGui.isMouseClicked(ImGuiMouseButton.Middle);
+            boolean altDown = ImGui.isKeyDown(GLFW.GLFW_KEY_LEFT_ALT) || ImGui.isKeyDown(GLFW.GLFW_KEY_RIGHT_ALT);
+            if (exportRangeDragStartTick >= 0) {
+                exportRangeDragged |= ImGui.isMouseDragging(ImGuiMouseButton.Middle);
+                if (exportRangeDragged) {
+                    ImGui.setMouseCursor(ImGuiMouseCursor.ResizeEW);
+                    int target = Math.max(0, Math.min(totalTicks, timelineXToReplayTick(mouseX - x)));
+                    upgradeToSceneWrite();
+                    editorScene.setExportTicks(Math.min(exportRangeDragStartTick, target),
+                        Math.max(exportRangeDragStartTick, target), totalTicks);
+                    editorState.markDirty();
+                }
+                if (!ImGui.isMouseDown(ImGuiMouseButton.Middle)) {
+                    releaseGrabbed(replayServer, totalTicks, contentY);
+                }
+            } else if (middleClicked && !altDown && !leftClicked && !rightClicked
+                && timelineWidth > 0 && mouseX > x + middleX && mouseX < x + width
+                && mouseY > y && mouseY < y + height - zoomBarHeight) {
+                releaseGrabbed(replayServer, totalTicks, contentY);
+                repositioningKeyframeTrack = -1;
+                exportRangeDragStartTick = Math.max(0, Math.min(totalTicks, timelineXToReplayTick(mouseX - x)));
+                exportRangeDragged = false;
+                draggingMouseButton = ImGuiMouseButton.Middle;
+            } else if (middleClicked && altDown && zoomBarWidth > 1f
+                && mouseY > y + middleY && mouseY < y + height
+                && mouseX > x + middleX && mouseX < x + width) {
+                releaseGrabbed(replayServer, totalTicks, contentY);
+                repositioningKeyframeTrack = -1;
+                grabbedZoomBar = true;
+                draggingMouseButton = ImGuiMouseButton.Middle;
+                zoomMinBeforeDrag = editorState.zoomMin;
+                zoomMaxBeforeDrag = editorState.zoomMax;
+                dragStartMouseX = mouseX;
+                dragStartMouseY = mouseY;
+            } else if (leftClicked && hoveredMarker != null) {
                 replayServer.goToReplayTick(hoveredMarkerTick);
                 if (hoveredMarker.position() != null) {
                     ReplayMarker.MarkerPosition position = hoveredMarker.position();
@@ -678,13 +714,6 @@ public class TimelineWindow {
 
                     replayServer.replayPaused = true;
                 }
-            } else if (zoomBarWidth > 1f && mouseY > y + middleY && mouseY < y + height && mouseX > x + middleX && mouseX < x + width && ImGui.isMouseDown(ImGuiMouseButton.Middle)) {
-                grabbedZoomBar = true;
-                draggingMouseButton = ImGuiMouseButton.Middle;
-                zoomMinBeforeDrag = editorState.zoomMin;
-                zoomMaxBeforeDrag = editorState.zoomMax;
-                dragStartMouseX = mouseX;
-                dragStartMouseY = mouseY;
             } else if (!ImGui.isAnyMouseDown()) {
                 releaseGrabbed(replayServer, totalTicks, contentY);
             }
@@ -1356,6 +1385,8 @@ public class TimelineWindow {
     }
 
     private static void releaseGrabbed(ReplayServer replayServer, int totalTicks, float contentY) {
+        exportRangeDragStartTick = -1;
+        exportRangeDragged = false;
         grabbedZoomBar = false;
         grabbedZoomBarResizeLeft = false;
         grabbedZoomBarResizeRight = false;

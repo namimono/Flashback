@@ -10,6 +10,11 @@ Flashback is a Minecraft mod which allows you to record your Minecraft gameplay,
 3. Install Flashback's JAR into your mods folder (.minecraft/mods)
 4. Run the game
 
+## Timeline shortcuts
+
+- Hold the middle mouse button and drag across the timeline ruler or tracks to set the in/out range. Drag in either direction; releasing keeps the range.
+- Hold Alt and drag with the middle mouse button to pan the timeline.
+
 ## Support
 
 If you need assistance installing or using the mod, feel free to join the [discord](https://discord.gg/flashbacktool) and ask for help in #support
