@@ -1008,6 +1008,17 @@ public class TimelineWindow {
 
         // Timeline
         if (mouseY > y && mouseY < y + middleY && mouseX > x + middleX && mouseX < x + width) {
+            if (ImGui.isMouseDoubleClicked(ImGuiMouseButton.Left)) {
+                grabbedPlayback = false;
+                replayServer.goToReplayTick(timelineXToReplayTick(mouseX - x));
+                replayServer.replayPaused = false;
+                Screen screen = Minecraft.getInstance().screen;
+                if (screen != null && screen.isPauseScreen()) {
+                    Minecraft.getInstance().setScreen(null);
+                }
+                return;
+            }
+
             if (editorScene.exportStartTicks >= 0 && editorScene.exportEndTicks >= 0 && mouseY > y + timestampHeight) {
                 int exportStartX = replayTickToTimelineX(editorScene.exportStartTicks);
                 int exportEndX = replayTickToTimelineX(editorScene.exportEndTicks);
