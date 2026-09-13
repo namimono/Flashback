@@ -195,6 +195,29 @@ remapJar {
 }
 
 
+tasks.register('testReplayTickSchedule', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.moulberry.flashback.playback.ReplayTickScheduleTest'
+}
+
+tasks.register('extractFontTestNatives', Copy) {
+    from zipTree('deps/imgui-natives.jar')
+    include 'com/moulberry/imgui-natives/*'
+    into layout.buildDirectory.dir('font-test-natives')
+}
+
+tasks.register('testFontAtlasMemory', JavaExec) {
+    dependsOn testClasses, extractFontTestNatives
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.moulberry.flashback.editor.ui.FontAtlasMemoryTest'
+    systemProperty 'imgui.library.path', layout.buildDirectory.dir('font-test-natives/com/moulberry/imgui-natives').get().asFile.absolutePath
+}
+
+tasks.named('check') {
+    dependsOn testReplayTickSchedule, testFontAtlasMemory
+}
+
 // configure the maven publication
 publishing {
     publications {

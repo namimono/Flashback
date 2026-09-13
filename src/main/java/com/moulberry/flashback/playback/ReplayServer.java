@@ -852,6 +852,14 @@ public class ReplayServer extends IntegratedServer {
 
         EditorState editorState = this.getEditorState();
 
+        if (this.jumpToTick >= 0) {
+            // Seeks bypass the normal wait, but MinecraftServer still advances this deadline.
+            // During export it can drift seconds ahead, delaying the post-export tick that
+            // clears processedSnapshot and allows the editor to render again.
+            this.nextTickTimeNanos = ReplayTickSchedule.afterJump(this.nextTickTimeNanos,
+                Util.getNanos(), this.tickRateManager().nanosecondsPerTick());
+        }
+
         this.lastReplayTick = this.targetTick;
         this.lastTickTimeNanos = this.nextTickTimeNanos - this.tickRateManager().nanosecondsPerTick();
 

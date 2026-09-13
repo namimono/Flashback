@@ -181,6 +181,8 @@ public class ReplayUI {
         ImGui.setCurrentContext(currentContext);
     }
 
+    private static final FontAtlasMemory fontAtlasMemory = new FontAtlasMemory();
+
     public static void initFonts(String languageCode) {
         if (languageCode != null) {
             ReplayUI.languageCode = languageCode;
@@ -195,6 +197,7 @@ public class ReplayUI {
         ImGuiIO io = ReplayUI.getIO();
         ImFontAtlas fonts = io.getFonts();
         fonts.clear();
+        fontAtlasMemory.close();
 
         int size = (int)(16 * getUiScale());
 
@@ -260,28 +263,28 @@ public class ReplayUI {
 
         fontConfig.setName("Inter (Medium), 16px");
         fontConfig.setGlyphOffset(0, 0);
-        font = fonts.addFontFromMemoryTTF(loadFont("inter-medium.ttf"), size, fontConfig, glyphRanges);
+        font = fontAtlasMemory.addFont(fonts, loadFont("inter-medium.ttf"), size, fontConfig, glyphRanges);
 
         // Merge in Japanese/Korean/Chinese/etc. characters if needed
         fontConfig.setMergeMode(true);
 
         fontConfig.setGlyphOffset(0, (int)(5 * getUiScale()));
-        io.getFonts().addFontFromMemoryTTF(loadFont("materialiconsround-regular.otf"), (int)(20 * getUiScale()), fontConfig, buildMaterialIconRanges());
+        fontAtlasMemory.addFont(fonts, loadFont("materialiconsround-regular.otf"), (int)(20 * getUiScale()), fontConfig, buildMaterialIconRanges());
         fontConfig.setGlyphOffset(0, 0);
 
         if (languageCode.startsWith("he")) {
             short[] hebrewRanges = new short[]{(short)'\u0590', (short)'\u05FF', (short)'\uFB1D', (short)'\uFB4F', 0};
-            io.getFonts().addFontFromMemoryTTF(loadFont("heebo-medium.ttf"), size, fontConfig, hebrewRanges);
+            fontAtlasMemory.addFont(fonts, loadFont("heebo-medium.ttf"), size, fontConfig, hebrewRanges);
         } else if (languageCode.startsWith("ja")) {
-            io.getFonts().addFontFromMemoryTTF(loadFont("notosansjp-medium.ttf"), size*5/4,
+            fontAtlasMemory.addFont(fonts, loadFont("notosansjp-medium.ttf"), size*5/4,
                 fontConfig, glyphRanges);
         } else if (languageCode.startsWith("zh")) {
-            io.getFonts().addFontFromMemoryTTF(loadFont("notosanstc-medium.ttf"), size*5/4,
+            fontAtlasMemory.addFont(fonts, loadFont("notosanstc-medium.ttf"), size*5/4,
                 fontConfig, glyphRanges);
-            io.getFonts().addFontFromMemoryTTF(loadFont("notosanssc-medium.ttf"), size*5/4,
+            fontAtlasMemory.addFont(fonts, loadFont("notosanssc-medium.ttf"), size*5/4,
                 fontConfig, glyphRanges);
         } else if (languageCode.startsWith("ko")) {
-            io.getFonts().addFontFromMemoryTTF(loadFont("notosanskr-medium.ttf"), size*5/4,
+            fontAtlasMemory.addFont(fonts, loadFont("notosanskr-medium.ttf"), size*5/4,
                 fontConfig, glyphRanges);
         }
         fontConfig.setMergeMode(false);

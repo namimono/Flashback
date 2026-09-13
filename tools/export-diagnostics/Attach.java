@@ -1,0 +1,11 @@
+import com.sun.tools.attach.VirtualMachine;
+class Attach {
+    public static void main(String[] args) throws Exception {
+        var vm = VirtualMachine.attach(args[0]);
+        try {
+            vm.loadAgent(args[1], args[2]);
+        } finally {
+            vm.detach();
+        }
+    }
+}
