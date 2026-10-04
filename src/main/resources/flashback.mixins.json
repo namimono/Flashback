@@ -70,6 +70,7 @@
     "compat.fabric.MixinBiomeModificationImpl",
     "compat.fabric.MixinFabricServerPlayNetworking",
     "compat.iris.MixinIrisSystemTimeUniforms",
+    "compat.iris.MixinIrisHandRenderer",
     "compat.replaymod.MixinReplayModRecording",
     "compat.voice_chat.MixinVoiceChatALSpeakerBase",
     "compat.voice_chat.MixinVoiceChatClientPlayerStateManager",
