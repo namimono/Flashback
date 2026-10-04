@@ -194,6 +194,18 @@ remapJar {
     input = shadowJar.getArchiveFile()
 }
 
+tasks.register('deploy', Copy) {
+    group = 'distribution'
+    description = 'Build, then copy the remapped mod jar into the Minecraft mods folder (overwrites same name).'
+    dependsOn build
+    from remapJar
+    into { file(project.findProperty('mods_dir')) }
+    duplicatesStrategy = DuplicatesStrategy.INCLUDE
+    doLast {
+        logger.lifecycle("Deployed ${remapJar.archiveFile.get().asFile.name} -> ${destinationDir}")
+    }
+}
+
 
 tasks.register('testReplayTickSchedule', JavaExec) {
     dependsOn testClasses

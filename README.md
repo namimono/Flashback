@@ -10,6 +10,15 @@ Flashback is a Minecraft mod which allows you to record your Minecraft gameplay,
 3. Install Flashback's JAR into your mods folder (.minecraft/mods)
 4. Run the game
 
+## Develop
+
+```bash
+# 编译并拷到游戏 mods 目录（同名覆盖）
+./deploy
+```
+
+`./deploy` 默认拷到 `C:\Users\Gigabyte\Downloads\minecraft\.minecraft\versions\1.21.1-Fabric movie\mods`，可用参数改目录：`./deploy "D:\other\mods"`。Windows 也可运行 `.\deploy.ps1`。
+
 ## Timeline shortcuts
 
 - Hold the middle mouse button and drag across the timeline ruler or tracks to set the in/out range. Drag in either direction; releasing keeps the range.
